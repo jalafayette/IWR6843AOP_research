@@ -1,0 +1,771 @@
+function calibration_plot()
+% CALIBRATION_PLOT  Calibração interativa de áreas de deteção com o IWR6843.
+%
+% Alteração: O Ponto 1 (P1) é automaticamente preenchido com a ponta da cancela (gateTip).
+% O técnico apenas precisa de definir o Ponto 2 (P2) para formar a Área Total.
+
+% ── Limpar portas série órfãs ────────────────────────────────────────────
+delete(instrfind)
+
+% ── Carregar config guardada pelo Setup ──────────────────────────────────
+cfgPortNum   = 1;
+datPortNum   = 2;
+cfgFile.path = '';
+cfgFile.name = '';
+comStatus    = 0;
+if exist('temp_config.mat', 'file')
+    try
+        S = load('temp_config.mat');
+        if isfield(S, 'cfgPortNum'), cfgPortNum = S.cfgPortNum; end
+        if isfield(S, 'datPortNum'), datPortNum = S.datPortNum; end
+        if isfield(S, 'cfgFile'),    cfgFile    = S.cfgFile;    end
+        if isfield(S, 'comStatus'),  comStatus  = S.comStatus;  end
+    catch ME
+        disp(['[CAL] Erro temp_config: ' ME.message]);
+    end
+end
+
+
+% ── Carregar Dimensões e Ângulo da Cancela ───────────────────────────────
+gateLength = 3.0;
+gateAngle  = 0;
+
+% 1. Carregar do state.mat (se existir)
+if exist('state.mat', 'file')
+    S_state = load('state.mat');
+    if isfield(S_state, 'gate_length'), gateLength = S_state.gate_length; end
+    if isfield(S_state, 'offset') && isstruct(S_state.offset) && isfield(S_state.offset, 'az')
+        gateAngle = S_state.offset.az;
+    end
+end
+
+% 2. temp_config.mat tem PRIORIDADE SOBRE O STATE (Valores inseridos no Setup atual)
+if exist('temp_config.mat', 'file')
+    S = load('temp_config.mat');
+    if isfield(S, 'tamanho_cancela') && ~isempty(S.tamanho_cancela)
+        gateLength = S.tamanho_cancela; 
+    end
+    if isfield(S, 'angulo_horizontal') && ~isempty(S.angulo_horizontal)
+        gateAngle = S.angulo_horizontal; 
+    end
+end
+
+% Garantir tipo numérico (double)
+if ischar(gateLength) || isstring(gateLength), gateLength = str2double(gateLength); end
+if ischar(gateAngle)  || isstring(gateAngle),  gateAngle  = str2double(gateAngle); end
+
+% 3. RECALCULAR SEMPRE o gateTip dinamicamente com base no ângulo e tamanho atuais!
+gateTip    = [gateLength * sind(gateAngle), gateLength * cosd(gateAngle)];
+gateDirVec = gateTip / max(norm(gateTip), 1e-6);
+
+% ── Estado da máquina ────────────────────────────────────────────────────
+% PONTO 1 É A PONTA DA CANCELA (gateTip). O TÉCNICO APENAS DEFINE O PONTO 2!
+numCorners = 1;
+corners        = nan(2, 2);  
+hCornerMarkers = [];
+totalVx = [];
+totalVy = [];
+corners(1, :)  = gateTip;     % P1 = gateTip automaticamente
+phase          = 2;           % Inicia logo na definição do Ponto 2
+faseAConcluida = false;      
+STILL_TIME     = 1.0;
+STILL_DIST     = 0.25;
+HIST_LEN       = 12;
+posHist        = nan(HIST_LEN, 2);
+histIdx        = 1;
+stillTimer     = 0;
+lastTime       = tic;
+RUN_CAL        = true;
+
+phaseLabels = { ...
+    'Area Total - Canto 1 (Ponta da Cancela Definido)'; ...
+    'Area Total - Canto 2 (Definir canto oposto a cancela)'};
+
+FASE_DESENHO = false;  
+zoneType     = 'Seguranca';
+safetyZones  = struct('xLeft',{},'xRight',{},'yNear',{},'yFar',{});
+triggerZones = struct('xLeft',{},'xRight',{},'yNear',{},'yFar',{},'lado',{});
+zonePatches  = gobjects(0);
+zoneOrder    = {};
+drawStart    = [];
+
+COLOR_SEGURANCA = [0.85 0.15 0.15];
+COLOR_TRIGGER   = [0.15 0.65 0.85];
+
+% ══════════════════════════════════════════════════════════════════════════
+% FIGURA (figure nativa)
+% ══════════════════════════════════════════════════════════════════════════
+hFig = figure('Name', 'Calibracao de Areas', ...
+    'NumberTitle',     'off', ...
+    'Color',           [0.10 0.10 0.10], ...
+    'Position',        [40 40 900 620], ...
+    'CloseRequestFcn', @fig_close);
+
+% ── Axes (vista superior XY) ─────────────────────────────────────────────
+hAx = axes('Parent', hFig, ...
+    'Units',    'pixels', ...
+    'Position', [60 70 510 510], ...
+    'Color',    [0.08 0.08 0.08], ...
+    'XColor',   [0.65 0.65 0.65], ...
+    'YColor',   [0.65 0.65 0.65], ...
+    'GridColor',[0.28 0.28 0.28], ...
+    'XGrid',    'on', ...
+    'YGrid',    'on', ...
+    'XLim',     [-5 5], ...
+    'YLim',     [0 8], ...
+    'XLimMode', 'manual', ...
+    'YLimMode', 'manual');
+hold(hAx, 'on');
+
+xlabel(hAx, 'X [m]', 'Color', [0.8 0.8 0.8]);
+ylabel(hAx, 'Y [m]', 'Color', [0.8 0.8 0.8]);
+title(hAx, 'Vista superior (sensor no centro)', 'Color', [0.85 0.85 0.85]);
+
+% Marcador de deteção (círculo verde)
+hDet = line(hAx, nan, nan, ...
+    'LineStyle',       'none', ...
+    'Marker',          'o', ...
+    'MarkerSize',      18, ...
+    'MarkerFaceColor', [0.15 0.80 0.20], ...
+    'MarkerEdgeColor', [0.00 1.00 0.10], ...
+    'LineWidth',       2);
+
+% Desenhar P1 (Ponta da Cancela) pré-definido
+hCornerPlot = line(hAx, corners(1,1), corners(1,2), ...
+    'LineStyle', 'none', ...
+    'Marker',    'x', ...
+    'MarkerSize', 14, ...
+    'Color',     [1.00 0.60 0.00], ...
+    'LineWidth', 3);
+
+text(hAx, gateTip(1), gateTip(2), sprintf('  P1 (Cancela: %.2f, %.2f)', gateTip(1), gateTip(2)), ...
+    'Color', [1.0 0.65 0.0], 'FontSize', 9, 'FontWeight', 'bold');
+
+% Patch da Área Total (invisível até ser gerado como polígono/losango)
+hTotalAreaRect = patch(hAx, nan, nan, [0.35 0.35 0.35], ...
+    'FaceAlpha', 0.10, 'EdgeColor', [0.75 0.75 0.75], ...
+    'LineWidth', 2.0, 'Visible', 'off');
+
+% Linha da cancela alimentada automaticamente via software
+hGateLine = line(hAx, [0 gateTip(1)], [0 gateTip(2)], ...
+    'Color', [1.0 0.2 0.2], 'LineWidth', 4, 'Visible', 'on');
+
+hZonePreview = patch(hAx, nan(1,5), nan(1,5), [1 1 1], ...
+    'FaceAlpha', 0.25, 'EdgeColor', [1 1 1], ...
+    'LineWidth', 2, 'LineStyle', '--', 'Visible', 'off');
+
+% ── Contorno de Segurança Rotacionado ao Longo da Cancela (+0.5m) ────────
+margin = 0.5; % Margem em metros
+xTip   = gateTip(1);
+yTip   = gateTip(2);
+
+% 1. Vetor unitário da cancela e vetor normal (perpendicular)
+len = sqrt(xTip^2 + yTip^2);
+if len > 1e-6
+    uX = xTip / len;
+    uY = yTip / len;
+else
+    uX = 0; uY = 1;
+end
+% Vetor normal para criar a largura da margem lateral
+nX = -uY;
+nY =  uX;
+
+% 2. Os 4 cantos da zona de segurança a envolver a linha [0,0] até [xTip, yTip] com folga
+% Margem extra na ponta e na base
+p1 = [0 - margin * uX - margin * nX,  0 - margin * uY - margin * nY]; % Base esquerda
+p2 = [0 - margin * uX + margin * nX,  0 - margin * uY + margin * nY]; % Base direita
+p3 = [xTip + margin * uX + margin * nX, yTip + margin * uY + margin * nY]; % Pista topo direita
+p4 = [xTip + margin * uX - margin * nX, yTip + margin * uY - margin * nY]; % Pista topo esquerda
+
+boxX = [p1(1), p2(1), p3(1), p4(1), p1(1)];
+boxY = [p1(2), p2(2), p3(2), p4(2), p1(2)];
+
+% 3. Desenhar o contorno inclinado
+hGateSafetyBox = patch(hAx, boxX, boxY, [1.0 0.2 0.2], ...
+    'FaceAlpha', 0.0, ...          % Transparente por dentro (só o contorno)
+    'EdgeColor', [1.0 0.2 0.2], ...  % Vermelho
+    'LineWidth', 1.8, ...
+    'LineStyle', '--');
+
+% ── Controlos ────────────────────────────────────────────────────────────
+xCtrl = 610;  wCtrl = 260;  ctrlBg = [0.12 0.12 0.12];
+
+% Indicador de fase (Apresenta logo a instrução do Canto 2)
+hPhaseBox = uicontrol(hFig, 'Style', 'text', ...
+    'Units',              'pixels', ...
+    'Position',           [xCtrl 540 wCtrl 55], ...
+    'String',             phaseLabels{2}, ...
+    'FontSize',           11, ...
+    'FontWeight',         'bold', ...
+    'ForegroundColor',    [1 1 1], ...
+    'BackgroundColor',    [0.18 0.38 0.62], ...
+    'HorizontalAlignment','center');
+
+% LED de imobilidade
+hLED = uicontrol(hFig, 'Style', 'text', ...
+    'Units',              'pixels', ...
+    'Position',           [xCtrl 460 wCtrl 65], ...
+    'String',             'A detetar...', ...
+    'FontSize',           12, ...
+    'ForegroundColor',    [1 1 1], ...
+    'BackgroundColor',    [0.45 0.10 0.10], ...
+    'HorizontalAlignment','center');
+
+% Botão "Definir Ponto"
+hDefBtn = uicontrol(hFig, 'Style', 'pushbutton', ...
+    'Units',           'pixels', ...
+    'Position',        [xCtrl 380 wCtrl 65], ...
+    'String',          'Definir Ponto (Canto 2)', ...
+    'FontSize',        14, ...
+    'FontWeight',      'bold', ...
+    'ForegroundColor', [0.45 0.45 0.45], ...
+    'BackgroundColor', [0.22 0.22 0.22], ...
+    'Enable',          'off', ...
+    'Callback',        @btnDefPointCallback);
+
+% Painel de coordenadas inicializado com o P1 (Cancela) já marcado
+hCoordsBox = uicontrol(hFig, 'Style', 'text', ...
+    'Units',              'pixels', ...
+    'Position',           [xCtrl 220 wCtrl 145], ...
+    'String',             {sprintf('Cantos definidos: 1 / 2'), ...
+                           sprintf('  P1 (Cancela) -> (%.2f, %.2f) m', gateTip(1), gateTip(2))}, ...
+    'FontSize',           10, ...
+    'ForegroundColor',    [0.80 0.80 0.80], ...
+    'BackgroundColor',    ctrlBg, ...
+    'HorizontalAlignment','left', ...
+    'Max',                2); 
+
+hZoneTypeSeg = uicontrol(hFig, 'Style', 'togglebutton', ...
+    'Units', 'pixels', 'Position', [xCtrl 380 wCtrl/2-5 40], ...
+    'String', 'Seguranca', 'FontSize', 11, 'FontWeight', 'bold', ...
+    'Value', 1, 'Visible', 'off', 'Callback', @(~,~) setZoneType('Seguranca'));
+
+hZoneTypeTrig = uicontrol(hFig, 'Style', 'togglebutton', ...
+    'Units', 'pixels', 'Position', [xCtrl+wCtrl/2+5 380 wCtrl/2-5 40], ...
+    'String', 'Trigger', 'FontSize', 11, 'FontWeight', 'bold', ...
+    'Value', 0, 'Visible', 'off', 'Callback', @(~,~) setZoneType('Trigger'));
+
+hUndoZoneBtn = uicontrol(hFig, 'Style', 'pushbutton', ...
+    'Units', 'pixels', 'Position', [xCtrl 330 wCtrl 40], ...
+    'String', 'Remover ultima zona', 'FontSize', 11, ...
+    'Visible', 'off', 'Callback', @(~,~) undoLastZone());
+
+% Botão "Voltar ao Setup"
+hBackBtn = uicontrol(hFig, 'Style', 'pushbutton', ...
+    'Units',           'pixels', ...
+    'Position',        [xCtrl 120 wCtrl 80], ...
+    'String',          '<- Voltar ao Setup', ...
+    'FontSize',        12, ...
+    'FontWeight',      'bold', ...
+    'ForegroundColor', [0.75 0.75 0.75], ...
+    'BackgroundColor', [0.28 0.28 0.28], ...
+    'Callback',        @(~,~) fig_close(hFig, []));
+
+% ══════════════════════════════════════════════════════════════════════════
+% INIT PORTAS SÉRIE
+% ══════════════════════════════════════════════════════════════════════════
+hDataPort = -1;
+hCfgPort  = -1;
+try
+    hDataPort = initDataPort(datPortNum);
+    hCfgPort  = initCfgPort(cfgPortNum);
+    disp(['[CAL] DataPort: COM' num2str(datPortNum) ...
+          '  CfgPort: COM' num2str(cfgPortNum)]);
+catch ME
+    disp(['[CAL] Erro ao abrir portos: ' ME.message]);
+end
+
+LOAD_CFG = false;
+if hCfgPort ~= -1 && hDataPort ~= -1
+    if comStatus == 0
+        if hDataPort.BytesAvailable > 0
+            comStatus = -1;
+            disp('[CAL] Sensor ja a correr. A usar config existente.');
+        else
+            fprintf(hCfgPort, 'version');
+            pause(0.5);
+            if hCfgPort.BytesAvailable > 0
+                for i = 1:10, fgets(hCfgPort); end
+                comStatus = 1;
+                disp('[CAL] Comunicacao OK.');
+            else
+                comStatus = -2;
+                disp('[CAL] Sem resposta do sensor.');
+            end
+        end
+    end
+    if comStatus == 1
+        LOAD_CFG = true;
+    elseif comStatus == -1
+        disp('[CAL] Sensor ja configurado — a saltar loadCfg.');
+    end
+else
+    disp('[CAL] AVISO: Portos nao abriram.');
+end
+
+cfgFullPath = [cfgFile.path cfgFile.name];
+cfgExists   = ~isempty(cfgFile.name) && exist(cfgFullPath, 'file');
+if LOAD_CFG && cfgExists
+    try
+        cliCfg = readCfgFile(cfgFullPath);
+        loadCfg(hCfgPort, cliCfg);
+        disp(['[CAL] CFG enviado: ' cfgFile.path]);
+        pause(0.5);
+    catch ME
+        disp(['[CAL] Erro CFG: ' ME.message]);
+    end
+elseif LOAD_CFG && ~cfgExists
+    disp('[CAL] AVISO: CFG nao encontrado. Seleciona no Setup antes de calibrar.');
+end
+
+if hDataPort ~= -1
+    bytesBuffer = zeros(1, hDataPort.InputBufferSize);
+else
+    bytesBuffer = zeros(1, 65536);
+end
+bytesBufferLen = 0;
+
+% ══════════════════════════════════════════════════════════════════════════
+% NESTED FUNCTIONS
+% ══════════════════════════════════════════════════════════════════════════
+    function [cx, cy] = getRobustCenter(x, y)
+        validIdx = ~isnan(x) & ~isnan(y);
+        x = x(validIdx);
+        y = y(validIdx);
+        
+        if isempty(x)
+            cx = NaN; cy = NaN; 
+            return; 
+        end
+        
+        % Para 3 ou menos pontos, a mediana direta é mais segura que estatística de outliers
+        if numel(x) <= 3
+            cx = median(x);
+            cy = median(y);
+            return;
+        end
+        
+        % Filtra pontos fantasma/outliers usando o Desvio Mediano Absoluto (MAD)
+        outliers = isoutlier(x, 'median') | isoutlier(y, 'median');
+        xClean = x(~outliers);
+        yClean = y(~outliers);
+        
+        if ~isempty(xClean)
+            cx = mean(xClean);
+            cy = mean(yClean);
+        else
+            cx = median(x);
+            cy = median(y);
+        end
+    end
+    
+    function fig_close(~, ~)
+        uiwait(warndlg({'Por favor, prima o botão de RESET (NRST) no radar', ...
+                    'antes de iniciar a nova configuração no Setup!'}, ...
+                   'Aviso de Reset Manual'));
+        RUN_CAL = false;
+    end
+
+    function definePoint(pt)
+        if nargin < 1 || isempty(pt) || numCorners >= 2
+            return;
+        end
+    
+        % 1. Manter os desenhos existentes no gráfico
+        hold(hAx, 'on');
+    
+        numCorners = numCorners + 1;
+        corners(numCorners, :) = pt;
+    
+        % 2. Criar marcadores visuais no gráfico (ponto + texto)
+        hP = plot(hAx, pt(1), pt(2), 'x', 'MarkerSize', 12, 'LineWidth', 3, 'Color', [1 0.6 0]);
+        hT = text(hAx, pt(1)+0.15, pt(2), sprintf('P%d (%.2f, %.2f)', numCorners, pt(1), pt(2)), ...
+                  'Color', [1 0.6 0], 'FontWeight', 'bold', 'FontSize', 10);
+        
+        % Guardar os handles visuais no array partilhado
+        hCornerMarkers = [hCornerMarkers, hP, hT];
+    
+        % 3. Atualizar texto do estado da interface (com Cell Array para múltiplas linhas)
+        if numCorners == 1
+            set(hCoordsBox, 'String', { ...
+                'Cantos definidos: 1 / 2', ...
+                sprintf('  P1 -> (%.2f, %.2f) m', pt(1), pt(2)) ...
+            });
+            set(hDefBtn, 'String', 'Definir Ponto (Canto 2)');
+    
+        elseif numCorners == 2
+            set(hCoordsBox, 'String', { ...
+                'Cantos definidos: 2 / 2', ...
+                sprintf('  P1: (%.2f, %.2f) m', corners(1,1), corners(1,2)), ...
+                sprintf('  P2: (%.2f, %.2f) m', corners(2,1), corners(2,2)) ...
+            });
+            set(hDefBtn, 'String', 'Área Total Concluída', 'Enable', 'off');
+
+            % ── 1. Vetores Diretor (u) e Perpendicular (n) à Cancela ──
+            p1 = corners(1, :)'; % Ponta da cancela (gateTip)
+            p2 = corners(2, :)'; % Ponto P2 clicado pelo utilizador
+
+            L = norm(p1);
+            if L > 1e-6
+                u = p1 / L;      % Vetor unitário ao longo da cancela
+            else
+                u = [0; 1];
+            end
+            n = [-u(2); u(1)];  % Vetor unitário perpendicular à cancela
+
+            % ── 2. Projeção de P2 nos Eixos da Cancela ──
+            w = dot(p2, n);      % Largura/afastamento perpendicular a partir da cancela
+            u_p2 = dot(p2, u);   % Extensão ao longo do comprimento
+
+            % Intervalo de comprimento (da base 0 à ponta L, expandindo se P2 for mais longe)
+            uMin = min([0, L, u_p2]);
+            uMax = max([0, L, u_p2]);
+
+            % ── 3. Vértices do Retângulo Encostado à Cancela ──
+            v1 = uMin * u;          % Canto base (sobre a linha da cancela)
+            v2 = uMin * u + w * n;  % Canto base deslocado pela largura w
+            v3 = uMax * u + w * n;  % Canto topo deslocado pela largura w
+            v4 = uMax * u;          % Canto topo (sobre a linha da cancela)
+
+            totalVx = [v1(1), v2(1), v3(1), v4(1), v1(1)];
+            totalVy = [v1(2), v2(2), v3(2), v4(2), v1(2)];
+
+            set(hTotalAreaRect, 'XData', totalVx, 'YData', totalVy, 'Visible', 'on');
+            
+            faseAConcluida = true;
+
+            % Tornar visíveis os botões de seleção de sub-áreas e remoção
+            set(hZoneTypeSeg, 'Visible', 'on');
+            set(hZoneTypeTrig, 'Visible', 'on');
+            set(hUndoZoneBtn, 'Visible', 'on');
+
+            % Ocultar os botões de definição de ponto e LED da Fase A
+            set(hDefBtn, 'Visible', 'off');
+            set(hLED, 'Visible', 'off');
+
+            % Atualizar mensagem de instrução
+            set(hPhaseBox, 'String', 'Desenhe sub-áreas (Segurança / Trigger) arrastando o rato no gráfico', ...
+                'BackgroundColor', [0.15 0.50 0.25]);
+
+            % Ativar callbacks do rato na figura para permitir o desenho das sub-zonas
+            set(hFig, 'WindowButtonDownFcn',   @mouseDown, ...
+                      'WindowButtonMotionFcn', @mouseMove, ...
+                      'WindowButtonUpFcn',     @mouseUp);% Tornar visíveis os botões de seleção de sub-áreas e remoção
+            set(hZoneTypeSeg, 'Visible', 'on');
+            set(hZoneTypeTrig, 'Visible', 'on');
+            set(hUndoZoneBtn, 'Visible', 'on');
+
+            % Ocultar os botões de definição de ponto e LED da Fase A
+            set(hDefBtn, 'Visible', 'off');
+            set(hLED, 'Visible', 'off');
+
+            % Atualizar mensagem de instrução
+            set(hPhaseBox, 'String', 'Desenhe sub-áreas (Segurança / Trigger) arrastando o rato no gráfico', ...
+                'BackgroundColor', [0.15 0.50 0.25]);
+
+            % Ativar callbacks do rato na figura para permitir o desenho das sub-zonas
+            set(hFig, 'WindowButtonDownFcn',   @mouseDown, ...
+                      'WindowButtonMotionFcn', @mouseMove, ...
+                      'WindowButtonUpFcn',     @mouseUp);
+        end
+    
+        % 4. Forçar a renderização imediata do gráfico na janela
+        drawnow;
+    end
+
+    function updateCoords()
+        nd = sum(~isnan(corners(:,1)));
+        lines = {sprintf('Cantos definidos: %d / 2', nd)};
+        lines{end+1} = sprintf('  P1 (Cancela) -> (%.2f, %.2f) m', corners(1,1), corners(1,2));
+        if nd >= 2
+            lines{end+1} = sprintf('  P2 (Op.)     -> (%.2f, %.2f) m', corners(2,1), corners(2,2));
+        end
+        set(hCoordsBox, 'String', lines);
+    end
+
+    function setZoneType(t)
+        zoneType = t;
+        set(hZoneTypeSeg, 'Value', strcmp(t,'Seguranca'));
+        set(hZoneTypeTrig, 'Value', strcmp(t,'Trigger'));
+    end
+
+    function pt = clampToTotalArea(ptWorld)
+        ptLoc = worldTiLocal(ptWorld);
+        
+        if ~isempty(totalVx) && ~isempty(totalVy)
+            % Converter os vértices da Área Total para coordenadas locais
+            V_total_loc = worldToLocal([totalVx(1:4)', totalVy(1:4)']);
+            uMin = min(V_total_loc(:,1)); uMax = max(V_total_loc(:,1));
+            vMin = min(V_total_loc(:,2)); vMax = max(V_total_loc(:,2));
+            
+            % Restringir estritamente ao retângulo local inclinado
+            pt = [min(max(ptLoc(1), uMin), uMax), ...
+                            min(max(ptLoc(2), vMin), vMax)];
+        else
+            pt = ptLoc;
+        end
+    end
+
+    function mouseDown(~, ~)
+        if ~faseAConcluida, return; end
+        p = get(hAx, 'CurrentPoint');
+        drawStart = clampToTotalArea(p(1,1:2));
+    end
+
+    function mouseMove(~, ~)
+        if ~faseAConcluida || isempty(drawStart), return; end
+        p = get(hAx, 'CurrentPoint');
+        pCur = clampToTotalArea(p(1,1:2));
+        rx = sort([drawStart(1) pCur(1)]);
+        ry = sort([drawStart(2) pCur(2)]);
+        col = COLOR_SEGURANCA; if strcmp(zoneType,'Trigger'), col = COLOR_TRIGGER; end
+        set(hZonePreview, 'XData', [rx(1) rx(2) rx(2) rx(1) rx(1)], ...
+                           'YData', [ry(1) ry(1) ry(2) ry(2) ry(1)], ...
+                           'EdgeColor', col, 'Visible', 'on');
+    end
+
+    function mouseUp(~, ~)
+        if ~faseAConcluida || isempty(drawStart), return; end
+        p = get(hAx, 'CurrentPoint');
+        pEnd = clampToTotalArea(p(1,1:2));
+        
+        pStart = drawStart; % Preserva as coordenadas de início antes de limpar
+        drawStart = [];
+        set(hZonePreview, 'Visible', 'off');
+
+        % Medidas locais da caixa desenhada
+        xL = min(pStart(1), pEnd(1));
+        xR = max(pStart(1), pEnd(1));
+        yN = min(pStart(2), pEnd(2));
+        yF = max(pStart(2), pEnd(2));
+
+        if abs(xR - xL) < 0.1 || abs(yF - yN) < 0.1
+            return;
+        end
+
+        V_loc = [xL, xR, xR, xL;
+                 yN, yN, yF, yF];
+
+        % Aplica inclinação se gateAngle != 0
+        if gateAngle ~= 0
+            R_gate = [cosd(-gateAngle) -sind(-gateAngle); 
+                      sind(-gateAngle)  cosd(-gateAngle)];
+            V_rot = R_gate * V_loc;
+        else
+            V_rot = V_loc;
+        end
+
+        vx = V_rot(1, :);
+        vy = V_rot(2, :);
+
+        col = COLOR_SEGURANCA;
+        if strcmp(zoneType, 'Seguranca')
+            safetyZones(end+1) = struct('xLeft', xL, 'xRight', xR, 'yNear', yN, 'yFar', yF);
+        else
+            col = COLOR_TRIGGER;
+            cx = mean(vx); cy = mean(vy);
+            side = gateDirVec(1)*cy - gateDirVec(2)*cx;
+            if side >= 0, lado = 'antes'; else, lado = 'depois'; end
+            triggerZones(end+1) = struct('xLeft', xL, 'xRight', xR, 'yNear', yN, 'yFar', yF, 'lado', lado);
+        end
+
+        zoneOrder{end+1} = zoneType;
+        hZ = patch(hAx, vx, vy, col, 'FaceAlpha', 0.25, 'EdgeColor', col, 'LineWidth', 2);
+        zonePatches(end+1) = hZ;
+    end
+
+    function undoLastZone()
+        if isempty(zonePatches), return; end
+        delete(zonePatches(end));
+        zonePatches(end) = [];
+        lastType = zoneOrder{end};
+        zoneOrder(end) = [];
+        if strcmp(lastType, 'Seguranca')
+            safetyZones(end) = [];
+        else
+            triggerZones(end) = [];
+        end
+    end
+
+    function btnDefPointCallback(~, ~)
+        if exist('numCorners', 'var') && numCorners >= 2
+            return;
+        end
+    
+        % Envia as coordenadas capturadas para a função
+        definePoint([cx, cy]);
+    end
+
+
+
+% ══════════════════════════════════════════════════════════════════════════
+% CICLO PRINCIPAL
+% ══════════════════════════════════════════════════════════════════════════
+frameCount   = 0;
+BUFFER_MAX   = 2^16;
+noDetTimer   = 0;          
+NO_DET_GRACE = 0.5;        
+while RUN_CAL && ishandle(hFig)
+    detX = [];
+    detY = [];
+    if hDataPort ~= -1
+        try
+            if bytesBufferLen > BUFFER_MAX * 0.9
+                bytesBufferLen = 0;
+            end
+            [bytesBuffer, bytesBufferLen, ~, ~] = ...
+                readUARTtoBuffer(hDataPort, bytesBuffer, bytesBufferLen, 0, -1);
+            [newframe, bytesBuffer, bytesBufferLen, ~, validFrame] = ...
+                parseBytes_AS(bytesBuffer, bytesBufferLen, 'FIFO');
+            if ~isempty(validFrame) && validFrame(1)
+                frameCount = frameCount + 1;
+                if isstruct(newframe.targets) && isfield(newframe.targets, 'tid') ...
+                        && numel(newframe.targets.tid) > 0
+                    detX = newframe.targets.posX;
+                    detY = newframe.targets.posY;
+                elseif isstruct(newframe.detObj) && isfield(newframe.detObj, 'x') ...
+                        && newframe.header.numDetectedObj > 0
+                    detX = newframe.detObj.x;
+                    detY = newframe.detObj.y;
+                elseif isstruct(newframe.staticDetObj) && isfield(newframe.staticDetObj, 'x') ...
+                        && newframe.header.numStaticDetectedObj > 0
+                    detX = newframe.staticDetObj.x';
+                    detY = newframe.staticDetObj.y';
+                end
+            end
+        catch ME
+            disp(['[CAL] Parse: ' ME.message]);
+        end
+    end
+    
+    % ── Lógica de imobilidade ─────────────────────────────────────────────
+    dt = toc(lastTime);
+    lastTime = tic;
+    if ~isempty(detX)
+        noDetTimer = 0;                              
+        set(hDet, 'XData', detX, 'YData', detY);
+        [cx, cy] = getRobustCenter(detX, detY);
+        posHist(histIdx, :) = [cx cy];
+        histIdx = mod(histIdx, HIST_LEN) + 1;
+        valid = posHist(~isnan(posHist(:,1)), :);
+        if size(valid, 1) >= 4
+            spread = max(range(valid(:,1)), range(valid(:,2)));
+            if spread < STILL_DIST
+                stillTimer = stillTimer + dt;
+            else
+                stillTimer = max(stillTimer - dt*2, 0);
+            end
+        else
+            stillTimer = 0;
+        end
+        ratio = min(stillTimer / STILL_TIME, 1.0);
+        if ratio >= 1.0
+            if strcmp(get(hDefBtn, 'Enable'), 'off')
+                set(hDefBtn, 'Enable', 'on', ...
+                    'BackgroundColor', [0.05 0.55 0.10], ...
+                    'ForegroundColor', [1.00 1.00 1.00]);
+            end
+            set(hLED, 'String', sprintf('Parado  (%.1f s)', stillTimer), ...
+                'BackgroundColor', [0.05 0.42 0.05]);
+        else
+            pct = round(ratio * 100);
+            set(hLED, 'String', sprintf('Aguardar imobilidade... %d%%', pct), ...
+                'BackgroundColor', [0.42 0.26 0.04]);
+            if ratio < 0.05
+                set(hDefBtn, 'Enable', 'off', ...
+                    'BackgroundColor', [0.22 0.22 0.22], ...
+                    'ForegroundColor', [0.45 0.45 0.45]);
+            end
+        end
+    else
+        noDetTimer = noDetTimer + dt;
+        if noDetTimer > NO_DET_GRACE
+            set(hDet, 'XData', nan, 'YData', nan);
+            stillTimer = max(stillTimer - dt, 0);
+            set(hLED, 'String', 'Sem detecao', ...
+                'BackgroundColor', [0.38 0.08 0.08]);
+            set(hDefBtn, 'Enable', 'off', ...
+                'BackgroundColor', [0.22 0.22 0.22], ...
+                'ForegroundColor', [0.45 0.45 0.45]);
+        end
+    end
+    drawnow          
+    pause(0.02)      
+end
+
+% =========================================================================
+% CLEANUP & GUARDAR
+% =========================================================================
+scriptFolder = fileparts(mfilename('fullpath'));
+stateFilepath = fullfile(scriptFolder, 'state.mat');
+
+% 1. Verificar se as variáveis da Área Total foram geradas na calibração
+hasArea = exist('totalVx', 'var') && ~isempty(totalVx) && ...
+          exist('totalVy', 'var') && ~isempty(totalVy);
+
+if hasArea
+    % Guardar a estrutura da Área Total rotacionada
+    totalArea = struct('vx', totalVx(1:4), 'vy', totalVy(1:4));
+                    
+    % Gerar Zona de Segurança Automática (+0.5m em redor da cancela)
+    margin = 0.5;
+    xTip = gateTip(1);
+    yTip = gateTip(2);
+    
+    autoSafety = struct(...
+        'xLeft',  min(0, xTip) - margin, ...
+        'xRight', max(0, xTip) + margin, ...
+        'yNear',  min(0, yTip) - margin, ...
+        'yFar',   max(0, yTip) + margin ...
+    );
+    
+    % Se o utilizador não desenhou zonas manuais, atribui a zona da cancela
+    if ~exist('safetyZones', 'var') || isempty(safetyZones)
+        safetyZones = autoSafety;
+    end
+    
+    % Variável singular para compatibilidade direta com a tabela do App Designer
+    safetyZone = autoSafety; 
+    
+    if ~exist('triggerZones', 'var')
+        triggerZones = [];
+    end
+
+    % Guardar todas as variáveis atualizadas no state.mat
+    save(stateFilepath, 'totalArea', 'gateTip', 'gateLength', 'gateAngle', ...
+         'safetyZones', 'safetyZone', 'triggerZones');
+    
+    fprintf('[CAL] Area total + cancela (%.2fm) + %d zonas de seguranca + %d triggers guardados.\n', ...
+        gateLength, numel(safetyZones), numel(triggerZones));
+else
+    totalArea = struct('vx', [], 'vy', []);
+    disp('[CAL] Calibracao incompleta.');
+end
+
+% =========================================================================
+% PARAR O SENSOR NO HARDWARE E FECHAR PORTAS ADEQUADAMENTE
+% =========================================================================
+if isvalid(hCfgPort) && strcmp(get(hCfgPort, 'Status'), 'open')
+    try
+        fprintf(hCfgPort, 'sensorStop');
+        pause(0.2);
+    catch
+    end
+    fclose(hCfgPort);
+end
+
+if isvalid(hDataPort) && strcmp(get(hDataPort, 'Status'), 'open')
+    fclose(hDataPort);
+end
+
+delete(instrfind);
+hDataPort = -1;
+hCfgPort  = -1;
+
+if ~RUN_CAL && ishandle(hFig)
+    delete(hFig);
+end
+
+disp('[CAL] Terminado.');
+end

@@ -1,0 +1,242 @@
+%% calibrate_person_car_logger.m
+%
+% Objetivo:
+%   Percorrer uma gravação UART (ficheiro .txt gerado pelo ENABLE_RECORD
+%   no setup_as_exported.m) OU capturar ao vivo da DATA_PORT, extrair por
+%   cada objeto detetado (agrupado pelo próprio GTRACK via pointType) as
+%   features: tamanho (bbox), SNR médio (proxy RCS), dispersão de
+%   doppler dentro do grupo (proxy micro-Doppler), e velocidade do track
+%   (Kalman-filtrada). Grava tudo numa tabela/CSV com o rótulo que
+%   definires (LABEL), para depois calibrares os limiares no script de
+%   classificação em tempo real.
+%
+% Usa diretamente as funções já existentes no teu projeto:
+%   getFrameHeader.m, getTLV.m, getGtrackPtCloud.m, getSideInfo.m,
+%   getGtrackTargetList.m, getGtrackPtType.m
+% (têm de estar no MATLAB path)
+%
+% Como usar:
+%   1. Grava uma sessão só com uma PESSOA a andar no campo de visão
+%      (usa o EnableRecord do setup_as_exported.m) -> ex: sessao_pessoa.txt
+%   2. Corre este script com LABEL='Pessoa' e RECORDING_FILE apontando
+%      para esse ficheiro
+%   3. Repete com um CARRO -> sessao_carro.txt, LABEL='Carro'
+%   4. Cada corrida faz "append" ao mesmo CSV (features_log.csv)
+%   5. Usa o script analyze_calibration_data.m para veres os limiares
+
+clear; clc;
+
+%% ---------------- CONFIGURAÇÃO DO UTILIZADOR ----------------
+START_FRAME = 90;   % ignora frames antes disto (a tua passagem a pé no início)
+LABEL = 'Carro';                       % <-- muda para 'Carro' na 2a sessão
+LIVE_MODE = false;                      % true = ler da DATA_P  ORT ao vivo
+DATA_PORT_NAME = 'COM11';                % usado só se LIVE_MODE = true
+DATA_BAUDRATE  = 921600;
+RECORDING_FILE = 'teste:cfg_.txt';   % usado só se LIVE_MODE = false
+OUTPUT_CSV = 'dados_xpto.csv';        % ficheiro cumulativo de calibração
+NUM_FRAMES_TO_CAPTURE = Inf;            % Inf = até acabar o ficheiro / Ctrl+C
+
+MAGIC_WORD = double([2 1 4 3 6 5 8 7]); % double, não uint8 — getFrameHeader/getTLV esperam double
+
+MMWDEMO_UART_MSG_DETECTED_POINTS           = 1;
+MMWDEMO_UART_MSG_DETECTED_POINTS_SIDE_INFO = 7;
+MMWDEMO_UART_MSG_TRACKERPROC_TARGET_LIST   = 10;
+MMWDEMO_UART_MSG_TRACKERPROC_TARGET_INDEX  = 11;
+
+%% ---------------- FONTE DE BYTES ----------------
+if LIVE_MODE
+    sp = serialport(DATA_PORT_NAME, DATA_BAUDRATE);
+    flush(sp);
+    fprintf('Ligado a %s @ %d baud (modo ao vivo).\n', DATA_PORT_NAME, DATA_BAUDRATE);
+else
+    % O ENABLE_RECORD do projeto grava em TEXTO HEXADECIMAL, não binário
+    % (confirmado em readUARTtoBuffer.m: fprintf(fid,'%02x ',newBytes')).
+    % Cada byte real está representado por 2 caracteres hex + espaço,
+    % ex.: o byte 0xFF aparece no ficheiro como o texto "ff ".
+    fid = fopen(RECORDING_FILE, 'r');
+    if fid == -1
+        error('Não foi possível abrir %s', RECORDING_FILE);
+    end
+    hexText = fscanf(fid, '%s');   % lê tudo, remove espaços/novas linhas automaticamente
+    fclose(fid);
+
+    % hexText tem 2 caracteres por byte -> reshape em pares e converte
+    if mod(numel(hexText), 2) ~= 0
+        hexText = hexText(1:end-1); % descarta último caracter incompleto, se houver
+    end
+    hexPairs = reshape(hexText, 2, [])';   % Nx2 char matrix
+    allFileBytes = double(hex2dec(hexPairs))';
+
+    fprintf('Ficheiro %s lido: %d bytes (descodificados de hex-texto).\n', RECORDING_FILE, numel(allFileBytes));
+end
+
+%% ---------------- ESTRUTURA DE OUTPUT ----------------
+% Cada linha = 1 objeto detetado (1 track) numa frame
+resultRows = table('Size', [0 13], ...
+    'VariableTypes', {'double','double','double','double','double','double','double','double','double','double','double','double','string'}, ...
+    'VariableNames', {'frame','tid','numPts','bboxDiag','meanSNR','medianSNR','snrQ1','snrQ3','range','snrNorm','dopplerStd','trackSpeed','label'});
+
+rawBuffer = double([]);
+readPos = 1;
+frameCount = 0;
+fileExhausted = false;
+
+%% ---------------- LOOP PRINCIPAL ----------------
+% Estrutura: por cada passagem do loop externo, primeiro ESVAZIA
+% completamente o buffer atual (processa TODAS as frames completas já
+% disponíveis), e só depois pede mais bytes (novo bloco do ficheiro, ou
+% novos bytes da porta série). Isto evita o bug de só processar 1 frame
+% por cada bloco de 64KB lido do ficheiro.
+while true
+
+    % ---- Esvazia o buffer: processa todas as frames completas disponíveis ----
+    while true
+        magicIdx = strfind(rawBuffer, MAGIC_WORD);
+        if numel(magicIdx) < 2
+            break; % precisa de mais bytes para isolar a próxima frame completa
+        end
+        if frameCount >= NUM_FRAMES_TO_CAPTURE
+            break;
+        end
+
+        % isola exatamente 1 frame completa: do 1o magic word até ao 2o (exclusivo)
+        frameBytes = rawBuffer(magicIdx(1):magicIdx(2)-1);
+        rawBuffer(1:magicIdx(2)-1) = []; % remove essa frame do buffer
+
+        %% ---- Parse usando as funções já existentes no projeto ----
+        idxPacket = 0;
+        [header, validFrame, idxPacket] = getFrameHeader(frameBytes, idxPacket);
+        if ~validFrame
+            continue;
+        end
+        frameCount = frameCount + 1;
+        if header.frameNumber < START_FRAME
+            continue;
+        end
+
+        detObj = [];
+        sideInfo = [];
+        targets = [];
+        pointType = [];
+
+        for i = 1:header.numTLVs
+            [tlv, idxPacket] = getTLV(frameBytes, idxPacket);
+            switch tlv.type
+                case MMWDEMO_UART_MSG_DETECTED_POINTS
+                    detObj = getGtrackPtCloud(tlv.payload);
+                case MMWDEMO_UART_MSG_DETECTED_POINTS_SIDE_INFO
+                    sideInfo = getSideInfo(header.numDetectedObj, tlv.payload);
+                case MMWDEMO_UART_MSG_TRACKERPROC_TARGET_LIST
+                    targets = getGtrackTargetList(tlv.payload);
+                case MMWDEMO_UART_MSG_TRACKERPROC_TARGET_INDEX
+                    pointType = getGtrackPtType(tlv.payload);
+            end
+        end
+
+        if mod(frameCount, 50) == 0
+            fprintf('Frame %d processada. %d linhas acumuladas.\n', frameCount, height(resultRows));
+        end
+
+        if isempty(detObj) || isempty(targets) || isempty(pointType) || isempty(targets.tid)
+            continue; % frame sem deteções úteis para calibração
+        end
+        if isempty(detObj.x)
+            continue;
+        end
+
+        numTargets = numel(targets.tid);
+
+        %% ---- Agrupa pontos por track usando pointType (associação do GTRACK) ----
+        for tIdx = 1:numTargets
+            % IMPORTANTE (confirmado com dados reais de 2 pessoas): pointType
+            % contém o Track ID (tid) REAL de cada ponto, não a posição do
+            % target no array. Um track pode "morrer" e o próximo a aparecer
+            % ocupa a mesma posição na lista mas com um tid diferente — por
+            % isso comparamos sempre contra targets.tid(tIdx), nunca (tIdx-1).
+            % Valores de pointType >= 253 (253/254/255) são códigos do GTRACK
+            % para "não associado / ruído", não um tid válido.
+            mask = (double(pointType) == targets.tid(tIdx));
+            numPts = sum(mask);
+
+            if numPts < 3
+                continue; % poucos pontos para uma estimativa de bbox fiável
+            end
+
+            xPts = detObj.x(mask);
+            yPts = detObj.y(mask);
+            dopplerPts = detObj.doppler(mask);
+
+            bboxDiag = norm([max(xPts)-min(xPts), max(yPts)-min(yPts)]);
+            dopplerStd = std(dopplerPts);
+
+            if ~isempty(sideInfo) && isfield(sideInfo, 'snr')
+                snrVals = double(sideInfo.snr(mask)) * 0.1; % 0.1 dB por LSB (formato standard TI)
+                meanSNR   = mean(snrVals);
+                medianSNR = median(snrVals);
+                snrQuart  = quantile(snrVals, [0.25, 0.75]);
+                snrQ1 = snrQuart(1);
+                snrQ3 = snrQuart(2);
+            else
+                meanSNR   = NaN;
+                medianSNR = NaN;
+                snrQ1     = NaN;
+                snrQ3     = NaN;
+            end
+            trackSpeed = norm([targets.velX(tIdx), targets.velY(tIdx)]);
+
+            range = norm([targets.posX(tIdx), targets.posY(tIdx)]);
+
+            if strcmpi(LABEL, 'Pessoa')
+                COMPENSATION_FACTOR = 6.99;
+            elseif strcmpi(LABEL, 'Carro')
+                COMPENSATION_FACTOR = 6.38; % declive real calculado via polyfit sobre dados_carro
+            else
+                COMPENSATION_FACTOR = 0.0;   % Valor genérico neutro
+            end
+
+            snrNorm = meanSNR + COMPENSATION_FACTOR*log10(max(range, 0.1));  
+
+            newRow = {frameCount, targets.tid(tIdx), numPts, bboxDiag, meanSNR, medianSNR, snrQ1, snrQ3, range, snrNorm, ...
+                      dopplerStd, trackSpeed, string(LABEL)};
+            resultRows(end+1, :) = newRow; %#ok<AGROW> % append correto de linha a table
+        end
+    end % fim do esvaziamento do buffer
+
+    if frameCount >= NUM_FRAMES_TO_CAPTURE
+        break;
+    end
+
+    % ---- Buffer esvaziado (ou quase): pede mais bytes ----
+    if LIVE_MODE
+        if sp.NumBytesAvailable > 0
+            newBytes = double(read(sp, sp.NumBytesAvailable, "uint8"));
+            rawBuffer = [rawBuffer, newBytes]; %#ok<AGROW>
+        else
+            pause(0.005);
+        end
+    else
+        if fileExhausted
+            break; % já não há mais bytes no ficheiro nem frames completas no buffer -> acabou
+        end
+        if readPos > numel(allFileBytes)
+            fileExhausted = true;
+            continue; % dá mais uma volta ao loop para garantir que o buffer fica mesmo vazio
+        end
+        chunkEnd = min(readPos + 65536 - 1, numel(allFileBytes));
+        rawBuffer = [rawBuffer, allFileBytes(readPos:chunkEnd)]; %#ok<AGROW>
+        readPos = chunkEnd + 1;
+    end
+end
+
+if LIVE_MODE
+    clear sp;
+end
+
+%% ---------------- GRAVA / FAZ APPEND AO CSV ----------------
+if isfile(OUTPUT_CSV)
+    writetable(resultRows, OUTPUT_CSV, 'WriteMode', 'Append');
+else
+    writetable(resultRows, OUTPUT_CSV);
+end
+
+fprintf('Concluído. %d linhas gravadas em %s (label=%s).\n', height(resultRows), OUTPUT_CSV, LABEL);

@@ -1,0 +1,1157 @@
+    
+clear, clc, close all
+delete(instrfind)
+
+global RESTART_SETUP
+RESTART_SETUP = false;
+
+while true  % ── OUTER LOOP: permite voltar ao Setup ──
+
+close all
+delete(instrfind)
+
+
+
+%% GET User Inputs & Setup Options
+SETUP_VIA_GUI = 1;
+ANTENNA_TYPE  = 1; % Hardcoded b/c only ISK/BOOST style currently supported.
+
+% --- Classificador Pessoa/Carro ---
+SWITCH_THRESHOLD = 10;              
+trackClassState  = containers.Map('KeyType','double','ValueType','any');
+
+
+%% OPTIONS & FLAGS
+SETUP_VIA_GUI  = 1; % 1 = Define parâmetros via GUI; 0 = Define via código
+REAL_TIME_MODE = 1; % 1 = Dados do Radar (UART);  0 = Playback do ficheiro .txt
+ENABLE_RECORD  = 0;
+
+% Configuração padrão das zonas
+zones.enable        = 1;
+zones.criticalStart = 0;
+zones.criticalEnd   = 1;
+zones.warnStart     = 1;
+zones.warnEnd       = 4;
+zones.projTime      = 2;
+
+
+%% 1. OBTER PARÂMETROS DE CONFIGURAÇÃO (GUI VS MANUAL)
+if (SETUP_VIA_GUI)
+    hApp = setup_as_exported_desing_exported(); 
+
+    % Carregar estado anterior na GUI
+    if exist('state.mat', 'file')
+        S = load('state.mat');
+        try
+            hApp.CFG_PORTEditField.Value    = num2str(S.comPort.cfg);
+            hApp.DATA_PORTEditField.Value   = num2str(S.comPort.data);
+            hApp.HeightmEditField.Value     = num2str(S.offset.height);
+            hApp.AnglegrausEditField.Value  = num2str(S.offset.az);
+
+            if isfield(S, 'cfgFile') && isstruct(S.cfgFile)
+                hApp.cfgFile = S.cfgFile;
+                hApp.CFGFileEditField.Value = fullfile(S.cfgFile.path, S.cfgFile.name);
+            end
+        catch
+            % Ignora se houver falha visual em algum campo
+        end
+    end
+
+    uiwait(hApp.UIFigure);
+
+    % Verificar se o utilizador cancelou
+    if ~isvalid(hApp) || ~hApp.IsAccepted
+        disp('[SETUP] Aplicação cancelada pelo utilizador. A encerrar...');
+        if isvalid(hApp), delete(hApp); end
+        return; 
+    end
+
+    % ── EXTRAIR DADOS DEFINIDOS NA GUI ──
+    
+    % Ficheiro CFG
+    if isprop(hApp, 'cfgFile') && ~isempty(hApp.cfgFile) && isstruct(hApp.cfgFile)
+        cfgFile = hApp.cfgFile;
+    elseif isprop(hApp, 'CFGFileEditField') && ~isempty(hApp.CFGFileEditField.Value)
+        [fPath, fName, fExt] = fileparts(hApp.CFGFileEditField.Value);
+        cfgFile.path = fPath;
+        cfgFile.name = [fName, fExt];
+    end
+    if isempty(cfgFile.path), cfgFile.path = pwd; end
+
+    % Inclinação, Altura e Portas COM
+    if isprop(hApp, 'InclinationEditField') && ~isempty(hApp.AnglegrausEditField.Value)
+        offset.az = str2double(hApp.AnglegrausEditField.Value);
+    end
+    if isprop(hApp, 'HeightEditField') && ~isempty(hApp.HeightmEditField.Value)
+        offset.height = str2double(hApp.HeightmEditField.Value);
+    end
+    if isprop(hApp, 'CFG_PORTEditField') && ~isempty(hApp.CFG_PORTEditField.Value)
+        comPort.cfg = str2double(hApp.CFG_PORTEditField.Value);
+    end
+    if isprop(hApp, 'DATA_PORTEditField') && ~isempty(hApp.DATA_PORTEditField.Value)
+        comPort.data = str2double(hApp.DATA_PORTEditField.Value);
+    end
+    comPort.status = 0;
+
+    % Geometria da Cancela e Zona de Segurança
+    if exist('state.mat', 'file')
+        S_prev = load('state.mat');
+        if isfield(S_prev, 'gateLength'), gLen = S_prev.gateLength; else, gLen = 3.0; end
+    else
+        gLen = 3.0;
+    end
+        
+    margin = 0.5;      
+    gAng   = hApp.AnglegrausEditField.Value; % Usa o valor extraído da GUI!
+        
+    xTip = gLen * sind(str2double(gAng));
+    yTip = gLen * cosd(str2double(gAng));
+
+    gateTip = [xTip, yTip];
+        
+    len = sqrt(xTip^2 + yTip^2);
+    if len > 1e-6, uX = xTip / len; uY = yTip / len; else, uX = 0; uY = 1; end
+    nX = -uY; nY = uX;
+        
+    p1 = [0 - margin*nX,    0 - margin*nY];
+    p2 = [0 + margin*nX,    0 + margin*nY];
+    p3 = [xTip + margin*nX, yTip + margin*nY];
+    p4 = [xTip - margin*nX, yTip - margin*nY];
+
+    px = [p1(1), p2(1), p3(1), p4(1)];
+    py = [p1(2), p2(2), p3(2), p4(2)];
+    
+    safetyZones.xLeft  = min(px);
+    safetyZones.xRight = max(px);
+    safetyZones.yNear  = min(py);
+    safetyZones.yFar   = max(py);
+    
+    safetyZones.vx = px;
+    safetyZones.vy = py;
+    hasSafety   = true;
+
+    % Guardar definições no state.mat
+    gateLength = gLen;
+    gateAngle  = gAng;
+    offset = hApp.offset;
+    save('state.mat', 'cfgFile', 'offset', 'comPort', 'safetyZones', 'gateLength', 'gateAngle', 'gateTip', '-append');
+    
+    delete(hApp); % Elimina a janela GUI da memória
+    disp('Setup via GUI concluído com sucesso!');
+
+else
+    % ── MODO APENAS PARA QUANDO NÃO USAS GUI (VALORES HARDCODED) ──
+    cfgFile.path  = pwd;
+    cfgFile.name  = 'area_scanner_static_tracker.cfg';
+    offset.height = 2;
+    offset.az     = 0;
+    comPort.cfg   = 19;
+    comPort.data  = 20;
+    comPort.status = 0;
+
+
+    if ~exist('triggerZones', 'var') || isempty(triggerZones)
+        % Exemplo de 1 Zona de Trigger na entrada da cancela:
+        triggerZones(1) = struct('xLeft', -1.5, 'xRight', 1.5, ...
+                                 'yNear', 1.0,  'yFar',   3.0, ...
+                                 'lado', 'entrada');
+    end
+end
+
+
+
+%% 2. CONFIGURAÇÃO DOS FICHEIROS DE LEITURA / LOGS
+datFile.path = '';
+datFile.name = 'areascanner_demo_uart_stream.txt'; % Usado se REAL_TIME_MODE == 0
+
+logFile.path = '';
+logFile.name = 'areascanner_demo_uart_stream.txt';
+
+if(ENABLE_RECORD && REAL_TIME_MODE)
+    if(~isempty(logFile.path))
+        if(logFile.path(end)~='\' && logFile.path(end)~='/')
+            logFile.path(end+1) = '\';
+        end
+        status = mkdir(logFile.path);
+    else
+        status = 1;
+    end
+    if(status)
+        str_logFile_path = string(logFile.path);
+        fid = fopen(fullfile(str_logFile_path, logFile.name),'w+');
+    end
+    if fid ~= -1
+        fprintf(['Opening ' logFile.name '. Ready to log data. \n']);
+    else
+        fprintf('Error with log file name or path. No logging. \n');
+        ENABLE_RECORD = 0;
+    end
+else
+    fid = -1;
+    ENABLE_RECORD = 0;
+end
+
+
+%% 3. LEITURA E PARSE DO CFG
+cfgFullPath = fullfile(cfgFile.path, cfgFile.name);
+
+if ~exist(cfgFullPath, 'file') && exist(fullfile(pwd, cfgFile.name), 'file')
+    cfgFullPath = fullfile(pwd, cfgFile.name);
+end
+
+try 
+    fprintf('A ler ficheiro de configuração: %s\n', cfgFullPath);
+    [cliCfg] = readCfgFile(cfgFullPath);
+catch ME
+    fprintf('Error: Could not open CFG file (%s). Quitting.\n', cfgFullPath);
+    if(ENABLE_RECORD && fid ~= -1)
+        fclose(fid);
+    end
+    return;
+end
+    
+
+platformType = hex2dec('6843'); 
+sdk_version  = 3.0;
+
+calc_P = parseCfg(cliCfg, platformType, sdk_version);
+
+% Garante o cálculo do rangeMax_m para o dimensionamento 3D
+if ~isfield(calc_P, 'rangeMax_m')
+    calc_P.rangeMax_m = calc_P.dataPath.rangeResolutionMeters * calc_P.dataPath.numRangeBins;
+end
+   
+
+%% INIT SERIAL PORTS
+if(REAL_TIME_MODE)
+
+    
+    %Init Ports
+    hDataPort = initDataPort(comPort.data);
+    hCfgPort = initCfgPort(comPort.cfg);
+    
+    %Check Port Status
+    if(comPort.status == 0) %Unknown status
+        if(hCfgPort ~= -1 && hDataPort ~=-1)
+            if(hDataPort.BytesAvailable)
+                %TODO: remove warning when config reload w/o NRST is enabled
+                comPort.status = -1;
+                fprintf('Device appears to already be running. Will not be able to load a new configuration. To load a new config, press NRST on the EVM and try again.');    
+            else       
+                fprintf(hCfgPort, 'version');
+                pause(0.5); % adding some delay to make sure bytes are received
+                response = '';
+                if(hCfgPort.BytesAvailable)
+                    for i=1:10 % version command reports back 10 lines TODO: change if SDK changes response
+                        rstr = fgets(hCfgPort);
+                        response = join(response, rstr);
+                    end
+                    fprintf('Test successful: CFG Porte Opened & Data Received');
+                    comPort.status = 1;
+                else
+                    fprintf('Port opened but no response received. Check port # and SOP mode on EVM');
+                    comPort.status = -2;
+                    fclose(hDataPort);
+                    fclose(hCfgPort);
+                end
+            end
+        else
+            comPort.status = -2;
+            fprintf('Could not open ports. Check port # and that EVM is powered with correct SOP mode.');    
+        end
+    end
+     
+else %REPLAY MODE
+    % Desativar manipuladores de portas série para o ciclo principal
+    hDataPort = -1;
+    hCfgPort  = -1;
+    
+    % 1. Carregar configurações e zonas guardadas (state.mat)
+    if exist('state.mat', 'file')
+        stateData = load('state.mat');
+        
+        if isfield(stateData, 'totalArea'),    totalArea    = stateData.totalArea;    end
+        if isfield(stateData, 'safetyZones'),  safetyZones  = stateData.safetyZones;  end
+        if isfield(stateData, 'triggerZones'), triggerZones = stateData.triggerZones; end
+        if isfield(stateData, 'gate_length'),  gate_length  = stateData.gate_length;  end
+        
+        fprintf('[PLAYBACK] Ficheiro state.mat carregado com sucesso.\n');
+    else
+        warning('[PLAYBACK] Ficheiro state.mat não foi encontrado.');
+    end
+    
+    % 2. Carregar o ficheiro de dados gravados (.txt)
+    dataFile = 'dados_gravados.txt'; % Nome do ficheiro por omissão
+    
+    % Caso o ficheiro não esteja no diretório atual, solicita ao utilizador
+    if ~exist(dataFile, 'file')
+        [filename, filepath] = uigetfile('*.txt', 'Selecione o ficheiro de dados (.txt)');
+        if isequal(filename, 0)
+            error('[PLAYBACK] Nenhum ficheiro selecionado para o modo replay.');
+        end
+        dataFile = fullfile(filepath, filename);
+    end
+    
+    % Ler os bytes binários gravados para o buffer de processamento
+    fid = fopen(dataFile, 'rb');
+    if fid ~= -1
+        bytesBuffer    = fread(fid, '*uint8');
+        bytesBufferLen = length(bytesBuffer);
+        fclose(fid);
+        
+        fprintf('[PLAYBACK] %d bytes carregados de: %s\n', bytesBufferLen, dataFile);
+    else
+        error('[PLAYBACK] Não foi possível abrir o ficheiro de dados: %s', dataFile);
+    end
+end
+
+
+
+ %% Set flags based on COM port status
+global RUN_VIZ
+if(~REAL_TIME_MODE)
+    RUN_VIZ = 1;
+    LOAD_CFG = 0;
+elseif(comPort.status == 1)
+    LOAD_CFG = 1;
+    RUN_VIZ = 1;
+elseif(comPort.status == -1)
+    LOAD_CFG = 0;
+    RUN_VIZ = 1;
+else
+    RUN_VIZ = 0;
+    LOAD_CFG = 0;
+end
+    
+%% Load Config
+if(LOAD_CFG) 
+    loadCfg(hCfgPort, cliCfg);
+end
+        
+if(RUN_VIZ)
+%% INIT Figure
+
+
+SHOW_DYNAMIC_PT_CLOUD = 0;
+SHOW_STATIC_PT_CLOUD = 0;
+SHOW_TRACKED_OBJ = 1;
+SHOW_STATS = 1;
+SHOW_ZONE = 0;
+
+hFig = figure('Name', 'Area Scanner Visualizer V2.0.0','Color','black','CloseRequestFcn',@plotfig_closereq);
+
+% init plot axes
+maxRange = max([calc_P.rangeMax_m]);
+
+if ischar(offset.height) || isstring(offset.height)
+    offset.height = str2double(offset.height);
+end
+
+if ischar(offset.az) || isstring(offset.az)
+    offset.az = str2double(offset.az);
+end
+
+[hFig, hAx3D] = init3DPlot_AS(hFig,[-maxRange maxRange],[0 maxRange], [0 offset.height]);
+
+% init fov lines - approximate guidelines only
+if (ANTENNA_TYPE==1)
+    azFOV = 120; 
+    elFOV = 40;  
+else
+    azFOV = 160; 
+    elFOV = 160;
+end
+hFOVLines = drawFOVLines(hAx3D, azFOV, elFOV, maxRange, offset);
+%reset the axes limits based on FOV TODO: Allow UI for axis limits
+hAx3D.XLim = [min(hFOVLines.azimuth.XData) max(hFOVLines.azimuth.XData)];
+hAx3D.YLim = [0 max([hFOVLines.boresight.YData hFOVLines.azimuth.YData hFOVLines.elevation.YData])];
+hAx3D.ZLim = [0 max([hFOVLines.boresight.ZData hFOVLines.azimuth.ZData hFOVLines.elevation.ZData])];
+
+% init handle for visualizing dynamic pt cloud
+styleDynPtCloud = {'LineStyle','none','Marker','.','Color',[0.3010 0.7450 0.9330],'MarkerSize',20};
+hDynamicPtCloud = line(hAx3D,0,0,0, styleDynPtCloud{:});
+
+% init handle for visualizing static pt cloud
+styleStaticPtCloud = {'LineStyle','none','Marker','square','Color','m','MarkerSize',20,'LineWidth',10};
+hStaticPtCloud = line(hAx3D,[],[],[], styleStaticPtCloud{:});
+
+% init handle for visualizing tracked objects
+styleTrackObj = {'LineStyle','none','Marker','o','MarkerEdge','w','MarkerSize',20,'LineWidth',4};
+
+hTrackObj = line(hAx3D,0,0,0, styleTrackObj{:});
+
+
+% =========================================================================
+% 1. CONSTANTES E CORES
+% =========================================================================
+COLOR_SAFETY_CLEAR  = [0.6 0.6 0.6];
+COLOR_SAFETY_OCC    = [1 0 0];
+COLOR_TRIGGER_CLEAR = [0.2 0.8 0.2];
+COLOR_TRIGGER_OCC   = [0 1 0.2];
+
+% =========================================================================
+% 2. LIMPEZA DE GRÁFICOS ANTERIORES (Evita sobreposição ao reexecutar)
+% =========================================================================
+if exist('hGateLineRealTime', 'var') && isgraphics(hGateLineRealTime), delete(hGateLineRealTime); end
+if exist('hSafetyPatch', 'var')      && isgraphics(hSafetyPatch),      delete(hSafetyPatch); end
+if exist('hSafetyStatus', 'var')     && isgraphics(hSafetyStatus),     delete(hSafetyStatus); end
+if exist('hTriggerPatch', 'var'),  delete(hTriggerPatch(isgraphics(hTriggerPatch))); end
+if exist('hTriggerStatus', 'var'), delete(hTriggerStatus(isgraphics(hTriggerStatus))); end
+
+% =========================================================================
+% 3. CARREGAMENTO E TRATAMENTO DOS DADOS (state.mat + Fallbacks)
+% =========================================================================
+S = struct();
+if exist('state.mat', 'file')
+    S = load('state.mat');
+    disp('[LOAD] Configurações e zonas recarregadas a partir do state.mat');
+end
+
+% --- A. Posição da Cancela (xTip, yTip) ---
+if isfield(S, 'gateTip')
+    xTip = S.gateTip(1);
+    yTip = S.gateTip(2);
+else
+    gLen = 3.0; gAng = 0;
+    if isfield(S, 'gateLength'), gLen = S.gateLength; end
+    if isfield(S, 'gateAngle'),  gAng = S.gateAngle;  end
+    xTip = gLen * sind(gAng);
+    yTip = gLen * cosd(gAng);
+end
+
+% --- B. Zonas de Trigger (triggerZones) ---
+if isfield(S, 'triggerZones') && ~isempty(S.triggerZones)
+    triggerZones = S.triggerZones;
+elseif ~exist('triggerZones', 'var') || isempty(triggerZones)
+    % Fallback de segurança se não existir nem no ficheiro nem na memória
+    triggerZones(1).xLeft = -1.5;
+    triggerZones(1).xRight = 1.5;
+    triggerZones(1).yNear  = 0.0;
+    triggerZones(1).yFar   = 7.0;
+    triggerZones(1).lado   = 'entrada';
+end
+
+% Converte automaticamente xLeft/xRight/yNear/yFar para vértices vx/vy
+for k = 1:numel(triggerZones)
+    if ~isfield(triggerZones(k), 'vx') || isempty(triggerZones(k).vx)
+        triggerZones(k).vx = [triggerZones(k).xLeft, triggerZones(k).xRight, triggerZones(k).xRight, triggerZones(k).xLeft];
+        triggerZones(k).vy = [triggerZones(k).yNear, triggerZones(k).yNear, triggerZones(k).yFar, triggerZones(k).yFar];
+    end
+end
+
+% =========================================================================
+% 4. CRIAÇÃO DOS ELEMENTOS GRÁFICOS NO PLOT
+% =========================================================================
+hold(hAx3D, 'on');
+
+% --- A. Linha da Cancela ---
+hGateLineRealTime = line(hAx3D, [0 xTip], [0 yTip], [0 0], ...
+    'Color', [1 0.2 0.2], 'LineWidth', 4, 'LineStyle', '-', 'DisplayName', 'Cancela');
+
+% --- B. Zona de Segurança ---
+if exist('hasSafety', 'var') && hasSafety
+    % 1. Usa prioritariamente os vértices guardados no state.mat
+    if exist('S', 'var') && isfield(S, 'safetyZones') && isfield(S.safetyZones, 'vx') && ~isempty(S.safetyZones.vx)
+        vx_safety = S.safetyZones.vx;
+        vy_safety = S.safetyZones.vy;
+    else
+        % 2. Recálculo direto ancorado estritamente na Origem (0,0) e na Ponta (xTip, yTip)
+        margin = 0.5;
+        len = sqrt(xTip^2 + yTip^2);
+        if len > 1e-6
+            uX = xTip / len; uY = yTip / len;
+        else
+            uX = 0; uY = 1;
+        end
+        nX = -uY; nY = uX; % Vetor perpendicular
+        
+        p1 = [0 - margin*nX,       0 - margin*nY];
+        p2 = [0 + margin*nX,       0 + margin*nY];
+        p3 = [xTip + margin*nX, yTip + margin*nY];
+        p4 = [xTip - margin*nX, yTip - margin*nY];
+        
+        vx_safety = [p1(1), p2(1), p3(1), p4(1)];
+        vy_safety = [p1(2), p2(2), p3(2), p4(2)];
+    end
+
+    hSafetyPatch = patch(hAx3D, vx_safety, vy_safety, zeros(1,4), COLOR_SAFETY_CLEAR, ...
+        'FaceAlpha', 0.25, 'EdgeColor', COLOR_SAFETY_CLEAR, 'LineStyle', '--', 'LineWidth', 1.5);
+    
+    hSafetyStatus = annotation(hFig, 'textbox', [0.01 0.65 0.25 0.08], ...
+        'String', {'Zona Seguranca', 'livre'}, ...
+        'Color', 'w', 'BackgroundColor', [0.2 0.2 0.2], 'LineStyle', 'none');
+end
+
+% --- C. Zonas de Trigger ---
+nTrigger = numel(triggerZones);
+hTriggerPatch  = gobjects(1, nTrigger);
+hTriggerStatus = gobjects(1, nTrigger);
+
+% Garantir a obtenção do gateAngle (do workspace ou da estrutura S)
+gateAngle = 0;
+if exist('gAng', 'var')
+    gateAngle = gAng;
+elseif isfield(S, 'gateAngle')
+    gateAngle = S.gateAngle;
+end
+
+% Converter gateAngle de char para double
+if ischar(gateAngle) || isstring(gateAngle)
+    ang = str2double(gateAngle);
+else
+    ang = double(gateAngle);
+end
+
+for k = 1:nTrigger
+    % Vértices de base (retângulo ortogonal sem rotação)
+    vx_raw = triggerZones(k).vx;
+    vy_raw = triggerZones(k).vy;
+    
+    % Rotação 2D de acordo com o gateAngle
+    % (Segue a mesma convenção do radar: 0º no eixo Y)
+    vx_trig =  vx_raw * cosd(ang) + vy_raw * sind(ang);
+    vy_trig = -vx_raw * sind(ang) + vy_raw * cosd(ang);
+    
+    hTriggerPatch(k) = patch(hAx3D, vx_trig, vy_trig, zeros(1,4), COLOR_TRIGGER_CLEAR, ...
+        'FaceAlpha', 0.25, 'EdgeColor', COLOR_TRIGGER_CLEAR, 'LineStyle', '--', 'LineWidth', 1.5);
+        
+    hTriggerStatus(k) = annotation(hFig, 'textbox', [0.01 0.55-0.1*(k-1) 0.25 0.08], ...
+        'String', {sprintf('Trigger %d', k), 'livre'}, ...
+        'Color', 'w', 'BackgroundColor', [0.2 0.2 0.2], 'LineStyle', 'none');
+end
+
+% --- D. Vetores de Tracking e Linhas de Projeção ---
+hTrackArrow    = quiver3(hAx3D, 0,0,0, 0,0,0, 'Color','w', 'LineWidth',2, 'MaxHeadSize',0.5, 'AutoScale','off');
+hTrackObjLabel = text([0 1], [0 1], [0 1], {'0', '1'}, 'FontSize', 10);
+hProjection    = line(hAx3D, 1, 1, 1);
+
+% Mantém proporção visual uniforme 1:1 nos eixos X e Y
+axis(hAx3D, 'equal');
+
+
+
+
+% show projection lines
+hProjection = line(hAx3D,1,1,1);
+
+% init handle for visualizing AS zones
+if(SHOW_ZONE)
+    rangeCritStart = zones.criticalStart;
+    rangeCritEnd = zones.criticalEnd;
+    rangeWarnStart = zones.warnStart;
+    rangeWarnEnd = zones.warnEnd;
+
+    zoneCrit = initRadialZone(rangeCritStart,rangeCritEnd,0,0,0,[1 0 0]);
+    zoneCrit.Parent = hAx3D;
+    zoneCrit.FaceAlpha = 0;
+
+    zoneWarn = initRadialZone(rangeWarnStart,rangeWarnEnd,0,0,0,[1 1 0]);
+    zoneWarn.Parent = hAx3D;
+    zoneWarn.FaceAlpha = 0;
+    
+    % draw lines for zone indicator in YZ view
+    hLineWarn = line(hAx3D,[0 0],[rangeWarnStart rangeWarnEnd],[0 0], 'LineStyle', '-', 'Color','y','LineWidth',6);
+    hLineCrit = line(hAx3D,[0 0],[rangeCritStart rangeCritEnd],[0 0], 'LineStyle', '-', 'Color','r','LineWidth',6);
+     
+end
+
+% init handle for stats textbox
+styleStats = {'LineStyle','none', 'FontUnits','normalized','FontSize',0.025};
+statsString = {'PlaceHolder'};
+hStats = annotation(hFig,'textbox',[0.01 0.8 0.3 0.2], 'String', statsString, styleStats{:},'Color','w'); 
+
+
+selectView = uicontrol(hFig,'Style','popupmenu',...
+    'Position',[10 10 100 25],...
+    'String',{'X-Y View','Y-Z View','X-Z View','3D View'},...
+    'Callback',@(selectView,event) selection(selectView,hAx3D));
+
+% Botão para voltar ao Setup sem fechar a aplicação
+uicontrol(hFig, 'Style', 'pushbutton', ...
+    'Position', [120 10 130 25], ...
+    'String',   '<- Voltar ao Setup', ...
+    'FontSize', 9, ...
+    'FontWeight', 'bold', ...
+    'Callback', @backToSetup);
+
+if(~REAL_TIME_MODE)
+    hFrameSlider = uicontrol(hFig,'Style','slider',...
+    'Min',1,'Max',100,'Value',1,...
+    'Units','Normalized', 'Position',[0.2 0.95 0.7 0.025]);
+    hFrameSlider.SliderStep = [1 10].*(1/(hFrameSlider.Max-hFrameSlider.Min));
+    
+    hPlayControl = uicontrol(hFig,'Style','popupmenu',...
+    'Units','Normalized', 'Position',[0.92 0.95 0.05 0.025],...
+    'String', {'Pause','Play'});
+end
+
+
+%% Pre-compute transformation matrix
+if ischar(offset.az) || isstring(offset.az)
+    offset.az = str2double(offset.az);
+end
+
+% Calcula a rotação correta baseada no ângulo de elevação (offset.el)
+rotMat_el = [1, 0, 0; ...
+             0, cosd(offset.az), -sind(offset.az); ...
+             0, sind(offset.az), cosd(offset.az)];
+transMat = rotMat_el;
+
+%% main - parse UART and update plots
+if(REAL_TIME_MODE)
+    bytesBuffer = zeros(1,hDataPort.InputBufferSize);
+    bytesBufferLen = 0;
+    isBufferFull = 0;
+    READ_MODE = 'FIFO';
+    disp('Real time');
+else
+    % read in entire file 
+    [bytesBuffer, bytesBufferLen, bytesAvailableFlag] = readDATFile2Buffer([datFile.path datFile.name], 'hex_dat');
+    READ_MODE = 'ALL';
+    [allFrames, bytesBuffer, bytesBufferLen, numFramesAvailable,validFrame] = parseBytes_AS(bytesBuffer, bytesBufferLen, 'ALL');
+    hFrameSlider.Max = numFramesAvailable;
+    hFrameSlider.SliderStep = [1 10].*1/(hFrameSlider.Max-hFrameSlider.Min);
+    disp('outra cena')
+end
+
+while (RUN_VIZ)    
+    
+    % get bytes from UART buffer or DATA file
+    if(REAL_TIME_MODE)
+        [bytesBuffer, bytesBufferLen, isBufferFull, bytesAvailableFlag] = readUARTtoBuffer(hDataPort, bytesBuffer, bytesBufferLen, ENABLE_RECORD, fid);
+         % parse bytes to frame
+        [newframe, bytesBuffer, bytesBufferLen, numFramesAvailable,validFrame] = parseBytes_AS(bytesBuffer, bytesBufferLen, READ_MODE);
+        frameIndex = 1;
+    else
+        frameIndex = round(hFrameSlider.Value);
+        newframe = allFrames(frameIndex);
+    end
+    
+   
+    
+    if(validFrame(frameIndex))
+        statsString = {['Frame: ' num2str(newframe.header.frameNumber)], ['Num Frames in Buffer: ' num2str(numFramesAvailable)]}; %reinit stats string each new frame
+        if(1)
+
+            % set frame flags
+            HAVE_VALID_DYNAMIC_PT_CLOUD = newframe.header.numDetectedObj ~= 0 && ~isempty(newframe.detObj);
+            HAVE_VALID_STATIC_PT_CLOUD = newframe.header.numStaticDetectedObj ~= 0 && ~isempty(newframe.staticDetObj);
+            HAVE_VALID_TARGET_LIST = ~isempty(newframe.targets);
+            
+            if(SHOW_DYNAMIC_PT_CLOUD)            
+                if(HAVE_VALID_DYNAMIC_PT_CLOUD)
+                    % Pt cloud hasn't been transformed based on offset TODO: move transformation to device
+                    rotatedPtCloud = transMat * [newframe.detObj.x; newframe.detObj.y; newframe.detObj.z];
+                    hDynamicPtCloud.XData = rotatedPtCloud(1,:);
+                    hDynamicPtCloud.YData = rotatedPtCloud(2,:);
+                    hDynamicPtCloud.ZData = rotatedPtCloud(3,:)+offset.height; 
+
+                else
+                    hDynamicPtCloud.XData = [];
+                    hDynamicPtCloud.YData = [];
+                    hDynamicPtCloud.ZData = [];
+                end
+            end
+            
+            if(SHOW_STATIC_PT_CLOUD)            
+                if(HAVE_VALID_STATIC_PT_CLOUD)
+                    % Pt cloud hasn't been transformed based on offset TODO: move transformation to device
+                    rotatedPtCloud = transMat * [newframe.staticDetObj.x'; newframe.staticDetObj.y'; newframe.staticDetObj.z'];
+                    hStaticPtCloud.XData = rotatedPtCloud(1,:);
+                    hStaticPtCloud.YData = rotatedPtCloud(2,:);
+                    hStaticPtCloud.ZData = rotatedPtCloud(3,:)+offset.height; 
+
+                else
+                    hStaticPtCloud.XData = [];
+                    hStaticPtCloud.YData = [];
+                    hStaticPtCloud.ZData = [];
+                end
+            end
+
+            if(SHOW_TRACKED_OBJ)
+                if(HAVE_VALID_TARGET_LIST)
+                    numTargets = numel(newframe.targets.tid);
+                    if(numTargets > 0)
+                        % Tracker coordinates transformation
+                        rotatedTargets = rotMat_el * [newframe.targets.posX; newframe.targets.posY; newframe.targets.posZ;];
+                        hTrackObj.XData = rotatedTargets(1,:);
+                        hTrackObj.YData = rotatedTargets(2,:);
+                        hTrackObj.ZData = rotatedTargets(3,:)+offset.height;
+                        
+                        delete(hTrackObjLabel);
+                        classLabels = cell(1, numTargets);
+                        
+                        for tIdx = 1:numTargets
+                            tid = newframe.targets.tid(tIdx);
+                            
+                            % =============================================================
+                            % SOLUÇÃO 1: PRINT NO TERMINAL QUANDO DETETA UM NOVO ALVO
+                            % =============================================================
+                            if ~isKey(trackClassState, tid)
+                                fprintf('--> [NOVO ALVO DETETADO] ID: %d | Total de alvos registados no histórico: %d\n', tid, trackClassState.Count + 1);
+                            end
+                            
+                            mask = (double(newframe.pointType) == tid);
+                            numPts = sum(mask);
+                        
+                            if numPts < 3
+                                if isKey(trackClassState, tid)
+                                    st = trackClassState(tid);
+                                    classLabels{tIdx} = st.confirmed;
+                                else
+                                    classLabels{tIdx} = '';
+                                end
+                                continue;
+                            end
+                        
+                            xs = newframe.detObj.x(mask);
+                            ys = newframe.detObj.y(mask);
+                            dops = newframe.detObj.doppler(mask);
+                            bboxDiag = norm([max(xs)-min(xs), max(ys)-min(ys)]);
+                            dopplerStd = std(dops);
+                        
+                            if ~isempty(newframe.sideInfo) && isfield(newframe.sideInfo, 'snr')
+                                snrVals   = double(newframe.sideInfo.snr(mask)) * 0.1;
+                            end
+                        
+                            trackSpeed = norm([newframe.targets.velX(tIdx), newframe.targets.velY(tIdx)]);
+                            label = classifyFrame(bboxDiag, dopplerStd, trackSpeed);
+                            
+                            classLabels{tIdx} = updateAndVote(trackClassState, SWITCH_THRESHOLD, tid, label);
+                        end
+                        
+                        % =============================================================
+                        % SOLUÇÃO 2: ID NUMÉRICO DESTACADO JUNTO AO CÍRCULO BRANCO
+                        % =============================================================
+                        labelStrings = arrayfun(@(k) {sprintf(' ID %d \n (%s)', newframe.targets.tid(k), classLabels{k})}, 1:numTargets);
+                        hTrackObjLabel = text(hAx3D, hTrackObj.XData, hTrackObj.YData, ...
+                            hTrackObj.ZData + 0.2, labelStrings, ... % +0.2 coloca o texto ligeiramente acima do círculo para não tapar
+                            'FontSize', 11, 'FontWeight', 'bold', ...
+                            'HorizontalAlignment', 'center', 'VerticalAlignment', 'bottom', ...
+                            'Color', 'black', 'BackgroundColor', 'white', 'Margin', 2); % Cria uma caixinha branca para destacar no fundo preto
+                    else
+                        delete(hTrackObjLabel);
+                        hTrackObjLabel = [];
+                        hTrackObj.XData = [];
+                        hTrackObj.YData = [];
+                        hTrackObj.ZData = [];
+                        hTrackArrow.XData = [];
+                        hTrackArrow.YData = [];
+                        hTrackArrow.ZData = [];
+                        hTrackArrow.UData = [];
+                        hTrackArrow.VData = [];
+                        hTrackArrow.WData = [];
+                        if trackClassState.Count > 0
+                            remove(trackClassState, keys(trackClassState));
+                        end
+                    end
+
+                    rotatedVel = rotMat_el * [newframe.targets.velX; newframe.targets.velY; newframe.targets.velZ];
+                    speed = sqrt(newframe.targets.velX.^2 + newframe.targets.velY.^2 + newframe.targets.velZ.^2);
+                    
+                    ARROW_SCALE = 1;
+                    MIN_SPEED_FOR_ARROW = 0.1;
+                    
+                    arrowU = rotatedVel(1,:) * ARROW_SCALE;
+                    arrowV = rotatedVel(2,:) * ARROW_SCALE;
+                    arrowW = rotatedVel(3,:) * ARROW_SCALE;
+                    arrowU(speed < MIN_SPEED_FOR_ARROW) = 0;
+                    arrowV(speed < MIN_SPEED_FOR_ARROW) = 0;
+                    arrowW(speed < MIN_SPEED_FOR_ARROW) = 0;
+                    
+                    hTrackArrow.XData = hTrackObj.XData;
+                    hTrackArrow.YData = hTrackObj.YData;
+                    hTrackArrow.ZData = hTrackObj.ZData;
+                    hTrackArrow.UData = arrowU;
+                    hTrackArrow.VData = arrowV;
+                    hTrackArrow.WData = arrowW;
+
+                   
+                else
+                        delete(hTrackObjLabel);
+                        hTrackObjLabel = [];
+                        hTrackObj.XData = [];
+                        hTrackObj.YData = [];
+                        hTrackObj.ZData = [];
+                        hTrackArrow.XData = [];
+                        hTrackArrow.YData = [];
+                        hTrackArrow.ZData = [];
+                        hTrackArrow.UData = [];
+                        hTrackArrow.VData = [];
+                        hTrackArrow.WData = [];
+                end
+            end
+
+            if(SHOW_ZONE) %TO DO: OPTIMIZE VISUALIZATION
+            else
+               % Garante que linhas de projeção antigas são limpas se o SHOW_ZONE for desativado
+               if exist('hProjection', 'var')
+                   delete(hProjection);
+                   hProjection = [];
+               end
+            end    
+               
+            % =============================================================
+            % SEPARAÇÃO LÓGICA FINA: DECISÃO DA CANCELA (CARRO vs PESSOA)
+            % =============================================================
+            cancela_pode_abrir = false;
+            cancela_impedida_fechar = false; % Bloqueio absoluto de segurança
+
+            if (HAVE_VALID_TARGET_LIST)
+                numTargetsDecisao = numel(newframe.targets.posX);
+                % Aplicar a rotação para termos as coordenadas reais no espaço 3D
+                rotatedTargetsDecisao = rotMat_el * [newframe.targets.posX; newframe.targets.posY; newframe.targets.posZ];
+                
+                for tIdx = 1:numTargetsDecisao
+                    tid = newframe.targets.tid(tIdx);
+                    tx = rotatedTargetsDecisao(1, tIdx);
+                    ty = rotatedTargetsDecisao(2, tIdx);
+                    
+                    % 1. Recuperar a classe final votada pelo teu classificador
+                    classeConfirmada = '';
+                    if isKey(trackClassState, tid)
+                        st = trackClassState(tid);
+                        classeConfirmada = lower(st.confirmed); % Ex: 'car', 'person', 'human'
+                    end
+                    
+                    % 2. REGRA DE SEGURANÇA: Pessoa debaixo da cancela (Não pode fechar!)
+                    if hasSafety
+                        inSafety = (tx >= safetyZones.xLeft && tx <= safetyZones.xRight && ...
+                                    ty >= safetyZones.yNear && ty <= safetyZones.yFar);
+                        if inSafety
+                            % Bloqueia o fecho da cancela
+                            cancela_impedida_fechar = true; 
+                            
+                            if strcmp(classeConfirmada, 'person') || strcmp(classeConfirmada, 'human')
+                                fprintf('⚠[SEGURANÇA] PESSOA (ID %d) detectada debaixo da cancela! Fecho ABORTADO.\n', tid);
+                            else
+                                % Por segurança física do hardware, se houver um veículo ou algo indefinido bloqueia também
+                                fprintf('⚠[SEGURANÇA] Alvo físico (ID %d - %s) detectado debaixo da cancela. Fecho impedido.\n', tid, classeConfirmada);
+                            end
+                        end
+                    end
+                    
+                    % 3. REGRA DE TRIGGER: Carro aproxima-se ou está na bilheteira (Abre!)
+                    % Se for apenas uma pessoa a tirar o bilhete a pé, a cancela NÃO abre.
+                    for k = 1:nTrigger
+                        % Usa os vértices do paralelogramo diretamente
+                        vx = triggerZones(k).vx;
+                        vy = triggerZones(k).vy;
+                        
+                        inTrigger = inpolygon(tx, ty, vx, vy);
+                                 
+                        if inTrigger
+                            if strcmp(classeConfirmada, 'car') || strcmp(classeConfirmada, 'vehicle')
+                                cancela_pode_abrir = true;
+                                set(hTriggerPatch(k), 'FaceColor', COLOR_TRIGGER_OCC, 'EdgeColor', COLOR_TRIGGER_OCC);
+                                set(hTriggerStatus(k), 'String', {sprintf('Trigger %d', k), 'OCUPADO (Carro)'});
+                                fprintf('[TRIGGER] VEÍCULO (ID %d) na Zona %d. Autorização enviada.\n', tid, k);
+                            end
+                        end
+                    end
+                end
+            end
+
+            % --- Envio de Ações Físicas (Exemplo de Integração) ---
+            if cancela_impedida_fechar
+                % [Código para manter a cancela aberta / Trancar relé de fecho]
+                % Ex: write(hComIndustrial, 'FORCE_OPEN');
+            elseif cancela_pode_abrir
+                % [Código para enviar pulso de abertura para a cancela]
+                % Ex: write(hComIndustrial, 'OPEN_GATE');
+            end
+            
+
+            % =============================================================
+            % DETEÇÃO COM FILTRAGEM DA ORIGEM (0,0) E SENSIBILIDADE DIRECIONAL
+            % =============================================================
+            allDetX = [];
+            allDetY = [];
+            allDetVy = []; % Velocidades no eixo Y
+            
+            if HAVE_VALID_TARGET_LIST
+                tgtRot = rotMat_el * [ newframe.targets.posX ; newframe.targets.posY ; newframe.targets.posZ ];
+                allDetX = [allDetX, tgtRot(1,:)];
+                allDetY = [allDetY, tgtRot(2,:)];
+                
+                rotVel = rotMat_el * [ newframe.targets.velX ; newframe.targets.velY ; newframe.targets.velZ ];
+                allDetVy = [allDetVy, rotVel(2,:)];
+            end
+            
+            if HAVE_VALID_DYNAMIC_PT_CLOUD
+                allDetX = [allDetX, hDynamicPtCloud.XData];
+                allDetY = [allDetY, hDynamicPtCloud.YData];
+                if isfield(newframe.detObj, 'doppler')
+                    allDetVy = [allDetVy, double(newframe.detObj.doppler(:))'];
+                else
+                    allDetVy = [allDetVy, zeros(1, length(hDynamicPtCloud.XData))];
+                end
+            end
+            
+            % --- A. Filtrar Ruído de Radar na Origem (0,0) ---
+            % Ignora pontos a menos de 0.2m do sensor que ativam a zona de segurança falsamente
+            validIdx = ~isnan(allDetX) & ~isnan(allDetY) & ((allDetX.^2 + allDetY.^2) > 0.2^2);
+            fDetX  = allDetX(validIdx);
+            fDetY  = allDetY(validIdx);
+            fDetVy = allDetVy(validIdx);
+
+            % --- B. Zona de Segurança (Polígono + Filtro) ---
+            if hasSafety
+                isSafetyOccupied = false;
+                if ~isempty(fDetX) && exist('vx_safety', 'var')
+                    inSafety = inpolygon(fDetX, fDetY, vx_safety, vy_safety);
+                    if any(inSafety)
+                        isSafetyOccupied = true;
+                    end
+                end
+
+                if isSafetyOccupied
+                    set(hSafetyPatch, 'FaceColor', COLOR_SAFETY_OCC, 'EdgeColor', COLOR_SAFETY_OCC, 'LineStyle', '-');
+                    hSafetyStatus.String = {'Zona Seguranca', 'OCUPADA'};
+                    hSafetyStatus.BackgroundColor = [0.45 0.05 0.05];
+                else
+                    set(hSafetyPatch, 'FaceColor', COLOR_SAFETY_CLEAR, 'EdgeColor', COLOR_SAFETY_CLEAR, 'LineStyle', '--');
+                    hSafetyStatus.BackgroundColor = [0.20 0.20 0.20];
+                end
+            end
+            
+            % --- C. Zonas de Trigger (Usa vértices rodados do mundo) ---
+            for k = 1:nTrigger
+                % Obter os vértices reais do Trigger (já rodados com o gateAngle)
+                if isfield(triggerZones(k), 'vx') && ~isempty(triggerZones(k).vx)
+                    vx_raw = triggerZones(k).vx;
+                    vy_raw = triggerZones(k).vy;
+                    % Aplica a rotação do ângulo da cancela se necessário
+                    vx_trig =  vx_raw * cosd(ang) + vy_raw * sind(ang);
+                    vy_trig = -vx_raw * sind(ang) + vy_raw * cosd(ang);
+                else
+                    vx_trig = [triggerZones(k).xLeft, triggerZones(k).xRight, triggerZones(k).xRight, triggerZones(k).xLeft];
+                    vy_trig = [triggerZones(k).yNear, triggerZones(k).yNear, triggerZones(k).yFar, triggerZones(k).yFar];
+                end
+                
+                inZoneIdx = [];
+                if ~isempty(fDetX)
+                    inZoneIdx = find(inpolygon(fDetX, fDetY, vx_trig, vy_trig));
+                end
+                
+                if ~isempty(inZoneIdx)
+                    velocidadesNaZona = fDetVy(inZoneIdx);
+                    
+                    if any(velocidadesNaZona < -0.1) 
+                        % APROXIMAÇÃO
+                        set(hTriggerPatch(k), 'FaceColor', [1 0.5 0], 'EdgeColor', [1 0.5 0], 'LineStyle', '-');
+                        hTriggerStatus(k).String = {sprintf('Trigger %d', k), 'APROXIMAÇÃO'};
+                        hTriggerStatus(k).BackgroundColor = [0.5 0.25 0];
+                        
+                    elseif any(velocidadesNaZona > 0.1)
+                        % AFASTAMENTO
+                        set(hTriggerPatch(k), 'FaceColor', [0 0.5 1], 'EdgeColor', [0 0.5 1], 'LineStyle', '-');
+                        hTriggerStatus(k).String = {sprintf('Trigger %d', k), 'AFASTAMENTO'};
+                        hTriggerStatus(k).BackgroundColor = [0 0.2 0.5];
+                        
+                    else
+                        % PARADO
+                        set(hTriggerPatch(k), 'FaceColor', COLOR_TRIGGER_OCC, 'EdgeColor', COLOR_TRIGGER_OCC, 'LineStyle', '-');
+                        hTriggerStatus(k).String = {sprintf('Trigger %d', k), 'OCUPADO'};
+                        hTriggerStatus(k).BackgroundColor = [0.00 0.38 0.06];
+                    end
+                else
+                    % LIVRE
+                    set(hTriggerPatch(k), 'FaceColor', COLOR_TRIGGER_CLEAR, 'EdgeColor', COLOR_TRIGGER_CLEAR, 'LineStyle', '--');
+                    hTriggerStatus(k).String = {sprintf('Trigger %d', k), 'livre'};
+                    hTriggerStatus(k).BackgroundColor = [0.20 0.20 0.20];
+                end
+            end
+
+
+            if(SHOW_STATS)
+               if(HAVE_VALID_DYNAMIC_PT_CLOUD)
+                   statsString{end+1} = ['Dynamic Points: ' num2str(newframe.header.numDetectedObj)];
+               else
+                   statsString{end+1} = ['Dynamic Points: '];
+               end
+               
+               if(HAVE_VALID_STATIC_PT_CLOUD)
+                   statsString{end+1} = ['Static Points: ' num2str(newframe.header.numStaticDetectedObj)];
+               else
+                   statsString{end+1} = ['Static Points: '];
+               end
+               
+               if(HAVE_VALID_TARGET_LIST)
+                   statsString{end+1} = ['Num Tracked Obj: ' num2str(numTargets)];
+               else
+                   statsString{end+1} = ['Num Tracked Obj: '];
+               end
+               
+               hStats.String = statsString;
+            end 
+            
+
+            
+        end % have validFrame
+        if(REAL_TIME_MODE)
+            drawnow limitrate
+        else
+            drawnow
+            if(RUN_VIZ && hPlayControl.Value == 2 && hFrameSlider.Value+1<=hFrameSlider.Max)
+                hFrameSlider.Value = hFrameSlider.Value+1;
+            end
+        end
+    else % have data in newFrame
+    end
+end %while inf
+
+
+%% close ports
+if(REAL_TIME_MODE)
+    if exist('hCfgPort', 'var') && isvalid(hCfgPort) && strcmp(get(hCfgPort, 'Status'), 'open')
+        try
+            fprintf(hCfgPort, 'sensorStop');
+            pause(0.2);
+        catch
+        end
+        fclose(hCfgPort);
+        fclose(hDataPort);
+    end
+    
+    if exist('hDataPort', 'var') && isvalid(hDataPort) && strcmp(get(hDataPort, 'Status'), 'open')
+        fclose(hDataPort);
+    end
+    
+    delete(instrfind);
+    if(ENABLE_RECORD)
+        c = fclose(fid);
+        if(c == 0)
+            disp('Log file closed w/o error.')
+        else
+            disp('Error closing log file.');
+        end
+    end
+    disp('Visualizer terminated.')
+end
+end
+
+% ── Verificar se o utilizador quer voltar ao Setup ────────────────────────
+if RESTART_SETUP
+    RESTART_SETUP = false;
+    continue    % volta ao início do outer loop → reabre Setup
+else
+    break       % sai completamente
+end
+
+end
+% ── FIM DO OUTER LOOP ──
+
+%% Helper functions
+function backToSetup(~, ~)
+global RUN_VIZ RESTART_SETUP
+
+uiwait(warndlg({'Por favor, prima o botão de RESET (NRST) no radar', ...
+                    'antes de iniciar a nova configuração no Setup!'}, ...
+                   'Aviso de Reset Manual'));
+
+    RUN_VIZ = 0;
+    RESTART_SETUP = true;
+    delete(gcf)
+end
+
+function plotfig_closereq(src,callbackdata)
+global RUN_VIZ
+% Close request function 
+% to display a question dialog box 
+   s = questdlg('Close This Figure?',...
+      'Close Request Function',...
+      'Yes','No','Yes'); 
+   switch s 
+      case 'Yes'
+         RUN_VIZ = 0; 
+         delete(gcf)
+      case 'No'
+         RUN_VIZ = 1;
+      return 
+   end
+end
+
+function selection(selectView,ax)
+    val = selectView.Value;
+    switch val
+        case 1
+            view(ax, 0,90);           
+        case 2
+            view(ax, 90,0);
+        case 3
+            view(ax, 0,0);
+        case 4
+            view(ax, 170,10);
+    end
+end
+
+
+
+function label = classifyFrame(bboxDiag, dopplerStd, trackSpeed)
+% CLASSIFYFRAME Classifica o alvo detetado pelo radar entre 'Carro' e 'Pessoa'
+%
+% Baseado na Árvore de Decisão com validação cruzada 10-fold (Erro = 6.8%)
+% focado nas medianas e intervalos interquartis (resistente a outliers/ruído).
+%
+% Entradas:
+%   bboxDiag   - Diagonal da bounding box do cluster [m] (Mediana Carro: 1.51m | Pessoa: 0.65m)
+%   dopplerStd - Desvio-padrão do Doppler/micro-Doppler [m/s] (Mediana Carro: 0.29m/s | Pessoa: 0.36m/s)
+%   trackSpeed - Velocidade de rastreio [m/s] (opcional)
+%
+% Saída:
+%   label      - 'Carro' ou 'Pessoa'
+
+    % --- Limiares Robustos (Baseados em Quartis/Medianas) ---
+    THRESH_BBOX_HIGH  = 1.44622;  % Separa a mediana/Q3 de Carro do limite superior de Pessoa
+    THRESH_DOPPLER    = 0.253224; % Separa corpo rígido (Carro) de movimento de membros (Pessoa)
+    THRESH_BBOX_LOW   = 0.468351; % Abaixo do Q1 de Pessoa (0.51m)
+
+    % --- Árvore de Decisão ---
+    if bboxDiag >= THRESH_BBOX_HIGH
+        % Dimensões físicas grandes -> Carro inequívoco
+        label = 'Carro';
+        
+    else
+        % Objeto de dimensão pequena a média ( < 1.45 m )
+        if dopplerStd >= THRESH_DOPPLER
+            % Micro-Doppler elevado (movimento articular/passos) -> Pessoa
+            label = 'Pessoa';
+            
+        else
+            % Baixo micro-Doppler (corpo rígido ou movimento linear)
+            if bboxDiag < THRESH_BBOX_LOW
+                % Dimensão muito reduzida -> Pessoa
+                label = 'Pessoa';
+            else
+                % Dimensão intermédia com movimento rígido -> Carro
+                label = 'Carro';
+            end
+        end
+    end
+end
+        
+        
+
+
+function majLabel = updateAndVote(trackClassState, SWITCH_THRESHOLD, tid, newLabel)
+        if isKey(trackClassState, tid)
+            st = trackClassState(tid);
+        else
+            st = struct('confirmed', newLabel, 'switchCounter', 0);
+        end
+    
+        if string(newLabel) == string(st.confirmed)
+            st.switchCounter = 0;   % concorda com o estado atual -> reset, sem ambiguidade
+        else
+            st.switchCounter = st.switchCounter + 1;
+            if st.switchCounter >= SWITCH_THRESHOLD
+                st.confirmed = newLabel;   % evidência sustentada -> só agora muda
+                st.switchCounter = 0;
+            end
+            % se ainda não atingiu o threshold, mantém a classe anterior (ignora o "ruído")
+        end
+    
+        trackClassState(tid) = st;
+        majLabel = st.confirmed;
+    end
